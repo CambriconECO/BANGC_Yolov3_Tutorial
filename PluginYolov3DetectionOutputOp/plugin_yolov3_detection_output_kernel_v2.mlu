@@ -1,0 +1,1116 @@
+/*************************************************************************
+ * Copyright (C) [2019] by Cambricon, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sublicense, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ *************************************************************************/
+#include <mlu.h>
+#include <algorithm>
+#include <stdio.h>
+#include <sys/time.h>
+
+#include "BANG_LOG.h"
+#include "plugin_yolov3_detection_helper.h"
+#include "nms_detection.h"
+/*!
+ *  @brief detectionOutputYolov3Kernel.
+ *
+ *  This function generates bounding boxes using
+ *  feature maps from feature-extraction networks
+ *
+ *  @papram[out] predicts
+ *    Output. Bounding boxes params, including batchIdx, classIdx, score,
+ *    x1, y1, x2, y2, and etc.
+ *  @param[in] input0
+ *    Input. The first feature map from previous network.
+ *  @param[in] input1
+ *    Input. The second feature map from previuos network.
+ *    This feature map is optional, depending on the network structure.
+ *  @param[in] input2
+ *    Input. The third feature map from previuos network.
+ *    This feature map is optional, depending on the network structure.
+ *  @param[in] input3
+ *    Input. The fourth feature map from previuos network.
+ *    This feature map is optional, depending on the network structure.
+ *  @param[in] input4
+ *    Input. The fifth feature map from previuos network.
+ *    This feature map is optional, depending on the network structure.
+ *  @param[in] input5
+ *    Input. The sixth feature map from previuos network.
+ *    This feature map is optional, depending on the network structure.
+ *  @param[in] input6
+ *    Input. The seventh feature map from previuos network.
+ *    This feature map is optional, depending on the network structure.
+ *  @param[in] buffer_gdram
+ *    Input. A tmp buffer shared by all ipu-cores assigned to this Op.
+ *    This param is used to store temp data when ct is full and to share
+ *    information, like maximum, among different cores.
+ *  @param[in] h_arr_dgram
+ *    Input. (H)eight of input0~6 tensors accordingly.
+ *  @param[in] w_arr_dgram
+ *    Input. (W)idth of input0~6 tensors accordingly.
+ *  @param[in] imageH_gdram
+ *    Input. (H)eight of input images.
+ *    This param is optional, only enables when CORRECT_ENABLED=true.
+ *  @param[in] imageW_gdram
+ *    Input. (W)idth of input images.
+ *    This param is optional, only enables when CORRECT_ENABLED=true.
+ *  @param[in] bias_gdram
+ *    Input. Biases of anchors used in h/w calculation.
+ *  @param[in] num_inputs
+ *    Input. Num of input tensors.
+ *  @param[in] num_classes
+ *    Input. Num of possible classes of each detected object.
+ *  @param[in] num_batches
+ *    Input. Num of batch, assuming every batch contains only one image.
+ *  @param[in] num_mask_groups
+ *    Input. Num of anchors, assuming same for all input tensors.
+ *  @param[in] num_max_boxes
+ *    Input. The largest possible number of bounding boxes.
+ *  @param[in] PAD_SIZE
+ *    Input. The padsize used for different type of network.
+ *  @param[in] neth
+ *    Input. (H)eight of network input tensor.
+ *  @param[in] netw
+ *    Input. (W)idth of network input tensor.
+ *  @param[in] condidence_thresh
+ *    Input. The minimal threshold for marking a box as an object.
+ *  @param[in] nms_thresh
+ *    Input. The minimal threshold for marking a box as a duplicate.
+ */
+template <typename T>
+__mlu_func__ void yolov3Kernel(T *predicts,
+                               T **inputs,
+                               T *buffer_gdram,
+                               int *h_arr,
+                               int *w_arr,
+                               float *biases,
+                               T *buffer,
+                               T *buffer_sram,
+                               int *boxCounts_nram,
+                               int *boxCounts_sram,
+                               T *conf_vector,
+                               T *temp,
+                               int num_inputs,
+                               int num_classes,
+                               int num_batches,
+                               int num_mask_groups,
+                               int num_max_boxes,
+                               int PAD_SIZE,
+                               int netw,
+                               int neth,
+                               T confidence_thresh,
+                               T nms_thresh) {
+  /*======================= Stage 0: initialization ========================*/
+  /* For yolov3 detection op, the number of result for decoding part is not
+   * determined. In other words, the address space for the dst tensor is
+   * variable. In order to fully utilize the onchip resource(NRAM/SRAM), the
+   * load/store strategies can only be determined during runtime.
+   *
+   * The input feature map will pass through a "filter", i.e., conf_thresh in
+   * the preprocess stage. The number of lefted boxes is uncertain, but it is
+   * ensured that the number will never be larger than the inputSize.
+   *
+   * The safest strategy is to malloc a buffer with the same size as the sum
+   * of all input feature maps, but this will definitely wastes most of the
+   * sapce in most cases, since one image can hardly contain thousands of
+   * objects. In addition, large output size "may" also result in deduction of
+   * DMA performance. As a result, a constant guess of number preprocess
+   * result is used here, i.e., OUTPUT_BUFFER_SIZE. In other words, this op
+   * assumes the number of left boxes will not exceed OUTPUT_BUFFER_SIZE after
+   * being filtered with conf_thresh. Users are free to adjust the macro
+   * according to their own dataset to get best performance.
+   */
+
+  int boxNumInit = 0;
+  int segSize = (num_classes + 5) * LINESIZE;
+  for (int i = 0; i < num_inputs; i++) {
+    int hw = h_arr[i] * w_arr[i];
+    boxNumInit += hw * num_mask_groups;
+  }
+
+  int dst_num = 0;
+  int num_entries = num_classes + 5;
+  int entryPad = PAD_UP(num_entries, C_PAD_SIZE);
+  int channels = num_entries * num_mask_groups;
+  int startBatch = 0;
+  int endBatch = 0;
+  int coreNum = 0;
+  int splitNum = std::min(coreDim, taskDim);
+
+  // Determine spliting strategy
+  T *result_preprocess;
+  T *result_nms;
+  T *result_topk;
+  T *preprocess_buffer;
+  T *nms_buffer;
+  mluMemcpyDirection_t preprocessStore;
+  mluMemcpyDirection_t nmsStore;
+  mluMemcpyDirection_t nmsLoad;
+  mluMemcpyDirection_t topkStore;
+  mluMemcpyDirection_t topkLoad;
+  int preprocessStoreSize = num_entries * TEMP_DST_STRIDE
+                          * splitNum * sizeof(T);
+  if (clusterDim == 0) {
+    // Single-core case
+    PRINTF_SCALAR("===== Preprocess Use Gdram Buffer =====\n");
+    startBatch = 0;
+    endBatch = num_batches;
+    coreNum = taskDim;
+    preprocess_buffer = (T *)buffer_gdram + boxNumInit * num_entries * clusterId;
+    preprocessStore = NRAM2GDRAM;
+    nmsLoad = GDRAM2NRAM;
+  } else if (clusterDim == 1) {
+    // Single-cluster case
+    startBatch = 0;
+    endBatch = num_batches;
+    int result_buffer_size = channels * 128 * sizeof(T);
+    if (preprocessStoreSize > SRAM_BUFFER_SIZE) {
+      PRINTF_SCALAR("===== Preprocess Use Gdram Buffer =====\n");
+      coreNum = taskDim;
+      preprocess_buffer = (T *)buffer_gdram + boxNumInit * num_entries * clusterId;
+      preprocessStore = NRAM2GDRAM;
+      nmsLoad = GDRAM2NRAM;
+    } else if (preprocessStoreSize > result_buffer_size) {
+      PRINTF_SCALAR("===== Preprocess Use Sram Buffer =====\n");
+      coreNum = coreDim;
+      preprocess_buffer = buffer_sram;
+      preprocessStore = NRAM2SRAM;
+      nmsLoad = SRAM2NRAM;
+    } else {
+      // TODO(yuluwei): add NRAM pipeline
+      PRINTF_SCALAR("===== Preprocess Use Nram Buffer =====\n");
+      preprocessStore = NRAM2NRAM;
+      nmsLoad = NRAM2NRAM;
+    }
+  } else {
+    // Multiple-cluster case
+    int clusterBatchSeg = num_batches / clusterDim;
+    int clusterBatchRem = num_batches % clusterDim;
+    startBatch = clusterBatchSeg * clusterId + std::min(clusterBatchRem, clusterId);
+    endBatch = startBatch + clusterBatchSeg + (clusterBatchRem > clusterId);
+    int result_buffer_size = channels * 128 * sizeof(T);
+    if (preprocessStoreSize > SRAM_BUFFER_SIZE) {
+      PRINTF_SCALAR("===== Preprocess Use Gdram Buffer =====\n");
+      coreNum = coreDim;
+      preprocess_buffer = (T *)buffer_gdram + boxNumInit * num_entries * clusterId;
+      preprocessStore = NRAM2GDRAM;
+      nmsLoad = GDRAM2NRAM;
+    } else if (preprocessStoreSize > result_buffer_size) {
+      PRINTF_SCALAR("===== Preprocess Use Sram Buffer =====\n");
+      coreNum = coreDim;
+      preprocess_buffer = buffer_sram;
+      preprocessStore = NRAM2SRAM;
+      nmsLoad = SRAM2NRAM;
+    } else {
+      PRINTF_SCALAR("===== Preprocess Use Nram Buffer =====\n");
+      preprocessStore = NRAM2NRAM;
+      nmsLoad = NRAM2NRAM;
+    }
+  }
+  PRINTF_SCALAR("startBatch: %d\n", startBatch);
+  PRINTF_SCALAR("endBatch: %d\n", endBatch);
+
+  __nramset((T *)conf_vector, C_PAD_SIZE, (T)confidence_thresh);
+  for (int batchIdx = startBatch; batchIdx < endBatch; batchIdx++) {
+    /*====================== Stage 1: Preprocess =======================*/
+    /* In this stage, a "decode" process is performed to get bounding boxes
+     * needed for nms stage. The input of this stage is [num_inputs] feature
+     * maps with size of [inputWs] and [inputHs]. The output of this stage
+     * is [5 + num_classes] normalized entries, including x, y, w, h,
+     * objectness, and probabilities for each class.
+     *
+     * In order to deal with arbitrarily large inputs, a "find limit" strategy
+     * is presented here. Large data block will be divided into smaller groups
+     * according to OUTPUT_BUFFER_SIZE and onchip space used during the
+     * decoding process.
+     *
+     * The equation used in this stage is as follows:
+     *   x = (sigmoid(x_feature) + coord_x) / inputW
+     *   y = (sigmoid(y_feature) + coord_y) / inputH
+     *   w = (exp(w_feature) + bias_w) / netw
+     *   h = (exp(h_feature) + bias_h) / neth
+     *   obj = sigmoid(obj_feature)
+     *   prob = sigmoid(prob_feature)
+     */
+    // Hardware timer
+    #if (__BANG_ARCH__ >= 200) && (__RECORD_TIME__ >= 2)
+    struct timeval tstart_batch;
+    struct timeval tstart_nms;
+    struct timeval tstart_topk;
+    struct timeval tend_batch;
+    gettimeofday(&tstart_batch, NULL);
+    #endif
+
+    int boxNumAfterPre = 0;
+    int boxNumAfterNms = 0;
+    result_preprocess = preprocess_buffer
+                      + coreId * num_entries * TEMP_DST_STRIDE;
+    T *batchPredicts = predicts + batchIdx * (num_max_boxes * 7 + 64);
+    PRINTF_SCALAR("========== clusterId: %d -> coreId: %d -> batchId: %d ==========\n",
+                  clusterId, coreId, batchIdx);
+    for (int inputIdx = 0; inputIdx < num_inputs; inputIdx++) {
+      if (clusterDim > 0) {
+        // __sync_cluster_ipu();
+        __asm__ __volatile__("barrier.sync.local 2, %[cnt];\n\t"
+                             ::[cnt]"r"(coreDim));
+      }
+      PRINTF_SCALAR("===== inputIdx: %d =====\n", inputIdx);
+      int h = h_arr[inputIdx];
+      int hSeg = h / splitNum;
+      int hRem = h % splitNum;
+      int hNum = hSeg + (hRem > coreId);
+      int hLoc = hSeg * coreId + std::min(hRem, coreId);
+      int w = w_arr[inputIdx];
+      int limit = (NRAM_BUFFER_SIZE / sizeof(T) / 2 / (2 + entryPad) - 64) / w;
+      if (limit > 0) {
+        //  Split H
+        int segNum = hNum / limit;
+        int remain = hNum % limit;
+        int dealNum = PAD_UP(limit * w, C_PAD_SIZE);
+        T* offset_w = buffer;
+        T* offset_h = buffer   + dealNum;
+        T* src      = offset_h + dealNum;
+        T* srcTrans = src + dealNum * entryPad;
+        for (int i = 0; i < w; i++) {
+          offset_w[i] = i;
+        }
+        __memcpy(offset_w + w,
+                 offset_w,
+                 w * sizeof(T),
+                 NRAM2NRAM,
+                 w * sizeof(T),
+                 0,
+                 limit - 1);
+        // TODO(yuluwei): optimize offset generating, need "unaligned nramset"
+        for (int anchorIdx = 0; anchorIdx < num_mask_groups; anchorIdx++) {
+          for (int i = 0; i < limit; i++) {
+            for (int j = 0; j < w; j++) {
+              offset_h[i * w + j] = i + hLoc;
+            }
+          }
+          int srcOffset = hLoc * w * channels + anchorIdx * num_entries
+                        + batchIdx * h * w * channels;
+          PRINTF_SCALAR("h: %d\n", h);
+          PRINTF_SCALAR("w: %d\n", w);
+          PRINTF_SCALAR("hSeg: %d\n", hSeg);
+          PRINTF_SCALAR("hRem: %d\n", hRem);
+          PRINTF_SCALAR("hNum: %d\n", hNum);
+          PRINTF_SCALAR("hLoc: %d\n", hLoc);
+          PRINTF_SCALAR("limit: %d\n", limit);
+          PRINTF_SCALAR("segNum: %d\n", segNum);
+          PRINTF_SCALAR("remain: %d\n", remain);
+          PRINTF_SCALAR("dealNum: %d\n", dealNum);
+          PRINTF_SCALAR("entryPad: %d\n", entryPad);
+          PRINTF_SCALAR("srcOffset: %d\n", srcOffset);
+          PRINTF_SCALAR("dst_ptr: %p\n", result_preprocess + boxNumAfterPre);
+          boxNumAfterPre += DecodeAllBBoxesFullW(
+                              result_preprocess + boxNumAfterPre,
+                              src,
+                              srcTrans,
+                              (T *)inputs[inputIdx] + srcOffset,
+                              conf_vector,
+                              biases,
+                              offset_w,
+                              offset_h,
+                              inputIdx,
+                              anchorIdx,
+                              h,
+                              w,
+                              num_entries,
+                              entryPad,
+                              limit,
+                              segNum,
+                              remain,
+                              dealNum,
+                              num_inputs,
+                              num_classes,
+                              num_mask_groups,
+                              netw,
+                              neth,
+                              preprocessStore);
+
+          if (remain > 0) {
+            int remainOffset = segNum * limit * w * channels;
+            srcOffset += remainOffset;
+            boxNumAfterPre += DecodeAllBBoxesFullW(
+                                result_preprocess + boxNumAfterPre,
+                                src,
+                                srcTrans,
+                                (T *)inputs[inputIdx] + srcOffset,
+                                conf_vector,
+                                biases,
+                                offset_w,
+                                offset_h,
+                                inputIdx,
+                                anchorIdx,
+                                h,
+                                w,
+                                num_entries,
+                                entryPad,
+                                remain,
+                                1,
+                                remain,
+                                PAD_UP(remain * w, C_PAD_SIZE),
+                                num_inputs,
+                                num_classes,
+                                num_mask_groups,
+                                netw,
+                                neth,
+                                preprocessStore);
+          }
+        }
+      } else {
+        // Split W
+        limit = (NRAM_BUFFER_SIZE / sizeof(T) / 2 / (2 + entryPad) - 64);
+        int segNum = w / limit;
+        int remain = w % limit;
+        int dealNum = PAD_UP(limit, C_PAD_SIZE);
+        T* offset_w = buffer;
+        T* offset_h = buffer   + dealNum;
+        T* src      = offset_h + dealNum;
+        T* srcTrans = src + dealNum * entryPad;
+
+        int hStart = hLoc;
+        int hEnd = hLoc + hNum;
+        for (int hIdx = hStart; hIdx < hEnd; hIdx++) {
+          __nramset((T *)offset_h, dealNum, (T)hIdx);
+          for (int anchorIdx = 0; anchorIdx < num_mask_groups; anchorIdx++) {
+            for (int ii = 0; ii < dealNum; ii++) {
+              offset_w[ii] = ii;
+            }
+            int srcOffset = hIdx * w * channels + anchorIdx * num_entries
+                          + batchIdx * h * w * channels;
+            PRINTF_SCALAR("==========\n");
+            PRINTF_SCALAR("w: %d\n", w);
+            PRINTF_SCALAR("h: %d\n", h);
+            PRINTF_SCALAR("hIdx: %d\n", h);
+            PRINTF_SCALAR("hNum: %d\n", hNum);
+            PRINTF_SCALAR("hLoc: %d\n", hLoc);
+            PRINTF_SCALAR("limit: %d\n", limit);
+            PRINTF_SCALAR("segNum: %d\n", segNum);
+            PRINTF_SCALAR("remain: %d\n", remain);
+            PRINTF_SCALAR("dealNum: %d\n", dealNum);
+            PRINTF_SCALAR("entryPad: %d\n", entryPad);
+            PRINTF_SCALAR("srcOffset: %d\n", srcOffset);
+            PRINTF_SCALAR("dst_ptr: %p\n", result_preprocess + boxNumAfterPre);
+            boxNumAfterPre += DecodeAllBBoxesPartW(
+                                result_preprocess + boxNumAfterPre,
+                                src,
+                                srcTrans,
+                                (T *)inputs[inputIdx] + srcOffset,
+                                conf_vector,
+                                biases,
+                                offset_w,
+                                offset_h,
+                                inputIdx,
+                                anchorIdx,
+                                h,
+                                w,
+                                num_entries,
+                                entryPad,
+                                limit,
+                                segNum,
+                                remain,
+                                dealNum,
+                                num_inputs,
+                                num_classes,
+                                num_mask_groups,
+                                netw,
+                                neth,
+                                preprocessStore);
+            PRINTF_SCALAR("boxNumAfterPre: %d\n", boxNumAfterPre);
+
+            if (remain > 0) {
+              int remainOffset = segNum * limit * channels;
+              srcOffset += remainOffset;
+              boxNumAfterPre += DecodeAllBBoxesPartW(
+                                  result_preprocess + boxNumAfterPre,
+                                  src,
+                                  srcTrans,
+                                  (T *)inputs[inputIdx] + srcOffset,
+                                  conf_vector,
+                                  biases,
+                                  offset_w,
+                                  offset_h,
+                                  inputIdx,
+                                  anchorIdx,
+                                  h,
+                                  w,
+                                  num_entries,
+                                  entryPad,
+                                  remain,
+                                  1,
+                                  remain,
+                                  PAD_UP(remain, C_PAD_SIZE),
+                                  num_inputs,
+                                  num_classes,
+                                  num_mask_groups,
+                                  netw,
+                                  neth,
+                                  preprocessStore);
+            }
+          }
+        }
+      }
+    }
+    PRINTF_SCALAR("===== check result_preprocess: %d\n", boxNumAfterPre);
+    PRINTF_VECTOR("----- x -----", "%hf ",
+                  buffer_sram + coreId * num_entries * TEMP_DST_STRIDE + TEMP_DST_STRIDE * 0, boxNumAfterPre);
+    PRINTF_VECTOR("----- y -----", "%hf ",
+                  buffer_sram + coreId * num_entries * TEMP_DST_STRIDE + TEMP_DST_STRIDE * 1, boxNumAfterPre);
+    PRINTF_VECTOR("----- w -----", "%hf ",
+                  buffer_sram + coreId * num_entries * TEMP_DST_STRIDE + TEMP_DST_STRIDE * 2, boxNumAfterPre);
+    PRINTF_VECTOR("----- h -----", "%hf ",
+                  buffer_sram + coreId * num_entries * TEMP_DST_STRIDE + TEMP_DST_STRIDE * 3, boxNumAfterPre);
+
+    // Share bounding boxes info with each cluster after the Preprocess Stage.
+    int totalBoxAfterPre = 0;
+    if (clusterDim > 0) {
+      // At least one cluster is used.
+      // sync and gather bboxes
+      boxCounts_sram[coreId] = boxNumAfterPre;
+      // we need __sync_cluster_ipu();
+      __asm__ __volatile__("barrier.sync.local 5, %[cnt];\n\t"
+                           ::[cnt]"r"(coreDim));
+      boxCounts_nram[0] = boxCounts_sram[0];
+      boxCounts_nram[1] = boxCounts_sram[1];
+      boxCounts_nram[2] = boxCounts_sram[2];
+      boxCounts_nram[3] = boxCounts_sram[3];
+      totalBoxAfterPre = boxCounts_nram[0] +
+                      boxCounts_nram[1] +
+                      boxCounts_nram[2] +
+                      boxCounts_nram[3];
+      PRINTF_SCALAR("boxCounts_nram[0]: %d\n", boxCounts_nram[0]);
+      PRINTF_SCALAR("boxCounts_nram[1]: %d\n", boxCounts_nram[1]);
+      PRINTF_SCALAR("boxCounts_nram[2]: %d\n", boxCounts_nram[2]);
+      PRINTF_SCALAR("boxCounts_nram[3]: %d\n", boxCounts_nram[3]);
+      PRINTF_SCALAR("boxCounts_sram[0]: %d\n", boxCounts_sram[0]);
+      PRINTF_SCALAR("boxCounts_sram[1]: %d\n", boxCounts_sram[1]);
+      PRINTF_SCALAR("boxCounts_sram[2]: %d\n", boxCounts_sram[2]);
+      PRINTF_SCALAR("boxCounts_sram[3]: %d\n", boxCounts_sram[3]);
+    } else {
+      // Only one ipu core is used.
+      boxCounts_nram[0] = boxNumAfterPre;
+      totalBoxAfterPre = boxNumAfterPre;
+    }
+    #if (__BANG_ARCH__ >= 200) && (__RECORD_TIME__ >= 2)
+    gettimeofday(&tstart_nms, NULL);
+    time_usec = (uint32_t)tstart_nms.tv_usec
+              - (uint32_t)tstart_batch.tv_usec;
+    time_sec  = (uint32_t)tstart_nms.tv_sec
+              - (uint32_t)tstart_batch.tv_sec;
+    printf("Cluster: %d Core: %d Batch: %d Preprocess Time: %u us\n",
+           clusterId, coreId, batchIdx, time_usec);
+    #endif
+    int totalBoxAfterPrePad = PAD_UP(totalBoxAfterPre, C_PAD_SIZE);
+    PRINTF_SCALAR("boxNumAfterPre: %d\n", boxNumAfterPre);
+    PRINTF_SCALAR("totalBoxAfterPre: %d\n", totalBoxAfterPre);
+    PRINTF_SCALAR("totalBoxAfterPrePad: %d\n", totalBoxAfterPrePad);
+
+    /*------------------------ Stage 2: nms by class -------------------------*/
+    /* This Stage is based on the nms function in CPU implementations.
+     * We perform NMS operation for each class assuming all classes share the
+     * same coords data accordingly.
+    */
+
+    // Find limit & multicore strategy for NMS part:
+    // 1. If nram is large enough for boxCount, split class
+    // 2. Otherwise, split totalBoxAfterPre
+    // Note: [20] totalBoxAfterPrePad are neeeded in order to spilt classes
+    //       Case 2 is currently unsupported due to nms and compiler bug.
+    PRINTF_SCALAR("========== NMS LOG ==========\n");
+    int limit = (NRAM_BUFFER_SIZE / sizeof(T) - OUTPUT_BUFFER_SIZE * 7)
+              / totalBoxAfterPrePad;
+    PRINTF_SCALAR("nms_limit: %d\n", limit);
+
+    // The maximal nmsStoreSize is reached when all bounding boxes belongs to
+    // all possible classes. However, in most cases, one bounding box only
+    // belongs to one class. In order to improve IO performance, an assumption
+    // is taken that each bounding box can belong to at most [AVG_CLASS_PER_BOX]
+    // classes. The default value is 8.
+    int nmsStoreStride = totalBoxAfterPrePad * AVG_CLASS_PER_BOX;
+    int nmsStoreSize = 7 * nmsStoreStride * splitNum * sizeof(T);
+    int dstAddr = 0;
+    if (nmsStoreSize + preprocessStoreSize <= SRAM_BUFFER_SIZE && clusterDim >= 1) {
+      PRINTF_SCALAR("Nms Use Sram Buffer: %d\n", nmsStoreSize);
+      nms_buffer = buffer_sram;
+      result_nms = nms_buffer
+                 + TEMP_DST_STRIDE * num_entries * coreNum
+                 + nmsStoreStride * 7 * coreId;
+      nmsStore = NRAM2SRAM;
+      topkLoad = SRAM2NRAM;
+      dstAddr = SRAM;
+    } else {
+      PRINTF_SCALAR("Nms Use Gdram Buffer: %d\n", nmsStoreSize);
+      nms_buffer = (T *)buffer_gdram + boxNumInit * num_entries * clusterId;
+      result_nms = nms_buffer
+                 + TEMP_DST_STRIDE * num_entries * coreNum
+                 + nmsStoreStride * 7 * coreId;
+      nmsStore = NRAM2GDRAM;
+      topkLoad = GDRAM2NRAM;
+      dstAddr = GDRAM;
+    }
+
+    if (limit >= 20) {
+      // In this case, nram size is large enough to perform a complete NMS
+      // Stage for at least one class. Hence, different classes are assigned to
+      // different ipu cores relatively evenly. If num_classes is less than
+      // coreDim(4 for MLU2XX), only num_classes ipu cores will be utilized.
+      int coreClassNum = num_classes / splitNum;
+      int coreClassRem = num_classes % splitNum;
+      int classStart = coreClassNum * coreId + std::min(coreId, coreClassRem);
+      int classEnd = classStart + coreClassNum + (coreId < coreClassRem);
+      int classIdx = classStart;
+      int classNum = std::min(limit - 11, classEnd - classStart);
+      int currClassNum = 0;
+
+      PRINTF_SCALAR("classStart: %d\n", classStart);
+      PRINTF_SCALAR("classEnd: %d\n", classEnd);
+      PRINTF_SCALAR("classNum: %d\n", classNum);
+      T *x1     = buffer;
+      T *y1     = x1 + totalBoxAfterPrePad;
+      T *x2     = y1 + totalBoxAfterPrePad;
+      T *y2     = x2 + totalBoxAfterPrePad;
+      T *prob   = y2 + totalBoxAfterPrePad;
+      int partNum = 0;
+      for (int coreIdx = 0; coreIdx < splitNum; coreIdx++) {
+        result_preprocess = preprocess_buffer
+                          + coreIdx * num_entries * TEMP_DST_STRIDE;
+        if (boxCounts_nram[coreIdx] > 0) {
+          __memcpy(x1 + partNum,
+                   result_preprocess,
+                   boxCounts_nram[coreIdx] * sizeof(T),
+                   nmsLoad,
+                   totalBoxAfterPrePad * sizeof(T),
+                   TEMP_DST_STRIDE * sizeof(T),
+                   3);
+          partNum += boxCounts_nram[coreIdx];
+        }
+      }
+      __bang_mul_const(x2, x2, 0.5, 2 * totalBoxAfterPrePad);
+      __bang_sub(x1, x1, x2, 2 * totalBoxAfterPrePad);
+      __bang_mul_const(x2, x2, 2, 2 * totalBoxAfterPrePad);
+      __bang_add(x2, x1, x2, 2 * totalBoxAfterPrePad);
+
+      if (sizeof(T) == 2) {
+        // If float16 data is used, accuracy compensation is necessary when
+        // computing the bounding box coordinates
+        __nramset((T *)temp, C_PAD_SIZE, (T)(1.0 / netw));
+        __bang_cycle_add(x2, x2, temp, totalBoxAfterPrePad, C_PAD_SIZE);
+        __nramset((T *)temp, C_PAD_SIZE, (T)(1.0 / neth));
+        __bang_cycle_add(y2, y2, temp, totalBoxAfterPrePad, C_PAD_SIZE);
+      }
+      // PRINTF_SCALAR("===== check nms coordinates\n");
+      // PRINTF_VECTOR("----- x1 -----", "%hf ", x1, totalBoxAfterPrePad);
+      // PRINTF_VECTOR("----- y1 -----", "%hf ", y1, totalBoxAfterPrePad);
+      // PRINTF_VECTOR("----- x2 -----", "%hf ", x2, totalBoxAfterPrePad);
+      // PRINTF_VECTOR("----- y2 -----", "%hf ", y2, totalBoxAfterPrePad);
+
+      T *buffer_nram = prob + classNum * totalBoxAfterPrePad;
+      while (classIdx < classEnd) {
+        PRINTF_SCALAR("========================\n");
+        PRINTF_SCALAR("classIdx: %d\n", classIdx);
+        PRINTF_SCALAR("currClassNum: %d\n", currClassNum);
+        if (!currClassNum) {
+          __bang_write_zero(prob, classNum * totalBoxAfterPrePad);
+          int partNum = 0;
+          for (int coreIdx = 0; coreIdx < splitNum; coreIdx++) {
+            result_preprocess = preprocess_buffer
+                              + coreIdx * num_entries * TEMP_DST_STRIDE;
+            if (boxCounts_nram[coreIdx] > 0) {
+              __memcpy(prob + partNum,
+                       result_preprocess + (classIdx + 5) * TEMP_DST_STRIDE,
+                       boxCounts_nram[coreIdx] * sizeof(T),
+                       nmsLoad,
+                       totalBoxAfterPrePad * sizeof(T),
+                       TEMP_DST_STRIDE * sizeof(T),
+                       std::min(classNum - 1, classEnd - classIdx));
+              partNum += boxCounts_nram[coreIdx];
+            }
+          }
+          currClassNum = classNum;
+        }
+
+        // PRINTF_VECTOR("prob", "%hf ",
+        //               prob + (classNum - currClassNum) * totalBoxAfterPrePad,
+        //               32);
+        int boxNumAfterNmsOneClass = 0;
+        nms_detection(boxNumAfterNmsOneClass,
+                      result_nms + boxNumAfterNms + 2 * nmsStoreStride,
+                      (Addr)dstAddr,
+                      prob + (classNum - currClassNum) * totalBoxAfterPrePad,
+                      x1,
+                      NRAM,
+                      buffer_nram,
+                      (256 * 5 + 11 * totalBoxAfterPrePad + C_PAD_SIZE) * sizeof(T),
+                      buffer_sram,
+                      NMS_BLOCK,
+                      totalBoxAfterPrePad,
+                      totalBoxAfterPrePad,
+                      nmsStoreStride,
+                      num_max_boxes,
+                      (T)nms_thresh,
+                      (T)confidence_thresh,
+                      1);
+        PRINTF_SCALAR("boxNumAfterNmsOneClass: %d\n", boxNumAfterNmsOneClass);
+        if (boxNumAfterNmsOneClass > 0) {
+          __nramset((T *)buffer_nram, totalBoxAfterPrePad, (T)batchIdx);
+          __memcpy(result_nms + boxNumAfterNms,
+                   buffer_nram,
+                   boxNumAfterNmsOneClass * sizeof(T),
+                   nmsStore);
+          __nramset((T *)buffer_nram, totalBoxAfterPrePad, (T)classIdx);
+          __memcpy(result_nms + boxNumAfterNms + nmsStoreStride,
+                   buffer_nram,
+                   boxNumAfterNmsOneClass * sizeof(T),
+                   nmsStore);
+        }
+        boxNumAfterNms += boxNumAfterNmsOneClass;
+        currClassNum -= 1;
+        classIdx += 1;
+      }
+    } else {
+      // TODO(yuluwei): support case 2
+
+
+    }
+    PRINTF_SCALAR("===== check result_nms: %d\n", boxNumAfterNms);
+
+    /*------------------------ Stage 3: Topk & store -------------------------*/
+    /* The algorithm of Yolov3DetectionOutput does not include a topk stage.
+     * Topk is performed here to save output space so that user to not need to
+     * malloc a gdram space with the same of input tensors.
+    */
+
+    if (clusterDim > 0) {
+      boxCounts_sram[coreId] = boxNumAfterNms;
+      // __sync_all_ipu();
+      __asm__ __volatile__("barrier.sync.local 8, %[cnt];\n\t"
+                           ::[cnt]"r"(coreDim));
+    }
+
+    #if (__BANG_ARCH__ >= 200) && (__RECORD_TIME__ >= 2)
+    gettimeofday(&tstart_topk, NULL);
+    time_usec = (uint32_t)tstart_topk.tv_usec
+              - (uint32_t)tstart_nms.tv_usec;
+    time_sec  = (uint32_t)tstart_topk.tv_sec
+              - (uint32_t)tstart_nms.tv_sec;
+    printf("Cluster: %d Core: %d Batch: %d NMS Time: %u us\n",
+           clusterId, coreId, batchIdx, time_usec);
+    #endif
+
+    // TODO(yuluwei): optimize topk stage literaly and mathematically
+    if (clusterDim > 0 && coreId == 0) {
+      // At least one cluster is used. Use ipu core 0 to gather results
+      PRINTF_SCALAR("MULTI-CORE TOPK\n");
+      boxCounts_nram[0] = boxCounts_sram[0];
+      boxCounts_nram[1] = boxCounts_sram[1];
+      boxCounts_nram[2] = boxCounts_sram[2];
+      boxCounts_nram[3] = boxCounts_sram[3];
+      int totalBoxAfterNms = boxCounts_nram[0] +
+                             boxCounts_nram[1] +
+                             boxCounts_nram[2] +
+                             boxCounts_nram[3];
+      PRINTF_SCALAR("boxCounts_nram[0]: %d\n", boxCounts_nram[0]);
+      PRINTF_SCALAR("boxCounts_nram[1]: %d\n", boxCounts_nram[1]);
+      PRINTF_SCALAR("boxCounts_nram[2]: %d\n", boxCounts_nram[2]);
+      PRINTF_SCALAR("boxCounts_nram[3]: %d\n", boxCounts_nram[3]);
+      PRINTF_SCALAR("boxCounts_sram[0]: %d\n", boxCounts_sram[0]);
+      PRINTF_SCALAR("boxCounts_sram[1]: %d\n", boxCounts_sram[1]);
+      PRINTF_SCALAR("boxCounts_sram[2]: %d\n", boxCounts_sram[2]);
+      PRINTF_SCALAR("boxCounts_sram[3]: %d\n", boxCounts_sram[3]);
+      int totalBoxAfterNmsPad = PAD_UP(totalBoxAfterNms, C_PAD_SIZE);
+      T* src = buffer;
+      int count = 0;
+      for (int coreIdx = 0; coreIdx < splitNum; coreIdx++) {
+        result_nms = nms_buffer
+                   + TEMP_DST_STRIDE * num_entries * coreNum
+                   + nmsStoreStride * 7 * coreIdx;
+        if (boxCounts_nram[coreIdx] > 0) {
+          __memcpy(src + count,
+                   result_nms,
+                   boxCounts_nram[coreIdx] * sizeof(T),
+                   topkLoad,
+                   totalBoxAfterNmsPad * sizeof(T),
+                   nmsStoreStride * sizeof(T),
+                   6);
+          count += boxCounts_nram[coreIdx];
+        }
+      }
+      batchPredicts[0] = (T)count;
+      PRINTF_SCALAR("Check result count: %d\n", count);
+      PRINTF_SCALAR("Check result totalBoxAfterNms: %d\n", totalBoxAfterNms);
+      if (count > num_max_boxes) {
+        // TODO(yuluwei): add quick filter
+        T *nramBatchPredicts = src + totalBoxAfterNmsPad * 7;
+        batchPredicts[0] = (T)num_max_boxes;
+        for (int boxIdx = 0; boxIdx < num_max_boxes; boxIdx++) {
+          __bang_max(temp, src + totalBoxAfterNmsPad * 2, totalBoxAfterNmsPad);
+          int maxIdx = (int)((unsigned short*)temp)[1] * (sizeof(T) == 2)
+                     + (int)((unsigned int*)temp)[1] * (sizeof(T) == 4);
+          nramBatchPredicts[boxIdx * 7 + 0] =
+            src[0 * totalBoxAfterNmsPad + maxIdx];
+          nramBatchPredicts[boxIdx * 7 + 1] =
+            src[1 * totalBoxAfterNmsPad + maxIdx];
+          nramBatchPredicts[boxIdx * 7 + 2] =
+            src[2 * totalBoxAfterNmsPad + maxIdx];
+          nramBatchPredicts[boxIdx * 7 + 3] =
+            src[3 * totalBoxAfterNmsPad + maxIdx];
+          nramBatchPredicts[boxIdx * 7 + 4] =
+            src[4 * totalBoxAfterNmsPad + maxIdx];
+          nramBatchPredicts[boxIdx * 7 + 5] =
+            src[5 * totalBoxAfterNmsPad + maxIdx];
+          nramBatchPredicts[boxIdx * 7 + 6] =
+            src[6 * totalBoxAfterNmsPad + maxIdx];
+          src[2 * totalBoxAfterNmsPad + maxIdx] = 0;
+        }
+        __memcpy(batchPredicts + 64,
+                 nramBatchPredicts,
+                 num_max_boxes * 7 * sizeof(T),
+                 NRAM2GDRAM);
+      } else if (count > 0) {
+        int transSeg = count / 256;
+        int transRem = count % 256;
+        // transpose by segment
+        for (int i = 0; i < transSeg; i++) {
+          __memcpy(src + totalBoxAfterNmsPad * 7,
+                   src + 256 * i,
+                   256 * sizeof(T),
+                   NRAM2NRAM,
+                   256 * sizeof(T),
+                   totalBoxAfterNmsPad * sizeof(T),
+                   6);
+          __bang_transpose(src + totalBoxAfterNmsPad * 7 + 256 * 64,
+                           src + totalBoxAfterNmsPad * 7,
+                           64,
+                           256);
+          __memcpy(batchPredicts + 64 + 256 * 7 * i,
+                   src + totalBoxAfterNmsPad * 7 + 256 * 64,
+                   7 * sizeof(T),
+                   NRAM2GDRAM,
+                   7 * sizeof(T),
+                   64 * sizeof(T),
+                   256 - 1);
+        }
+        if (transRem > 0) {
+          int dataSize = totalBoxAfterNmsPad - transSeg * 256;
+          __memcpy(src + totalBoxAfterNmsPad * 7,
+                   src + 256 * transSeg,
+                   dataSize * sizeof(T),
+                   NRAM2NRAM,
+                   PAD_UP(transRem, 64) * sizeof(T),
+                   totalBoxAfterNmsPad * sizeof(T),
+                   6);
+          __bang_transpose(src + totalBoxAfterNmsPad * 7 + PAD_UP(transRem, 64) * 64,
+                           src + totalBoxAfterNmsPad * 7,
+                           64,
+                           PAD_UP(transRem, 64));
+          __memcpy(batchPredicts + 64 + 256 * 7 * transSeg,
+                   src + totalBoxAfterNmsPad * 7 + PAD_UP(transRem, 64) * 64,
+                   7 * sizeof(T),
+                   NRAM2GDRAM,
+                   7 * sizeof(T),
+                   64 * sizeof(T),
+                   transRem - 1);
+        }
+        PRINTF_VECTOR("----- batchIdx -----", "%hf ",
+                      src + totalBoxAfterNmsPad * 0, count);
+        PRINTF_VECTOR("----- classIdx -----", "%hf ",
+                      src + totalBoxAfterNmsPad * 1, count);
+        PRINTF_VECTOR("----- score -----", "%hf ",
+                      src + totalBoxAfterNmsPad * 2, count);
+        PRINTF_VECTOR("----- x1 -----", "%hf ",
+                      src + totalBoxAfterNmsPad * 3, count);
+        PRINTF_VECTOR("----- y1 -----", "%hf ",
+                      src + totalBoxAfterNmsPad * 4, count);
+        PRINTF_VECTOR("----- x2 -----", "%hf ",
+                      src + totalBoxAfterNmsPad * 5, count);
+        PRINTF_VECTOR("----- y2 -----", "%hf ",
+                      src + totalBoxAfterNmsPad * 6, count);
+        #if (__BANG_ARCH__ >= 200) && (__RECORD_TIME__ >= 2)
+        gettimeofday(&tend_batch, NULL);
+        time_usec = (uint32_t)tend_batch.tv_usec
+                  - (uint32_t)tstart_topk.tv_usec;
+        time_sec  = (uint32_t)tend_batch.tv_sec
+                  - (uint32_t)tstart_topk.tv_sec;
+        printf("Cluster: %d Core: %d Batch: %d Topk Time: %u us\n",
+               clusterId, coreId, batchIdx, time_usec);
+        #endif
+      } else {
+
+      }
+    } else if (clusterDim == 0) {
+      int totalBoxAfterNmsPad = PAD_UP(boxNumAfterNms, 64);
+      PRINTF_SCALAR("SINGLE-CORE TOPK\n");
+      T *src = buffer;
+      batchPredicts[0] = (T)boxNumAfterNms;
+      if (boxNumAfterNms > num_max_boxes) {
+        // TODO(yuluwei): use quick filter
+        T *nramBatchPredicts = src + totalBoxAfterNmsPad * 7;
+        batchPredicts[0] = (T)num_max_boxes;
+        __memcpy(src,
+                 result_nms,
+                 boxNumAfterNms * sizeof(T),
+                 topkLoad,
+                 totalBoxAfterNmsPad * sizeof(T),
+                 nmsStoreStride * sizeof(T),
+                 6);
+
+        for (int boxIdx = 0; boxIdx < num_max_boxes; boxIdx++) {
+          __bang_max(temp, src + totalBoxAfterNmsPad * 2, totalBoxAfterNmsPad);
+          int maxIdx = (int)((unsigned short*)temp)[1] * (sizeof(T) == 2)
+                     + (int)((unsigned int*)temp)[1] * (sizeof(T) == 4);
+          __bang_printf("maxIdx: %d, maxValue: %f\n", maxIdx, temp[0]);
+          nramBatchPredicts[boxIdx * 7 + 0] =
+            src[0 * totalBoxAfterNmsPad + maxIdx];
+          nramBatchPredicts[boxIdx * 7 + 1] =
+            src[1 * totalBoxAfterNmsPad + maxIdx];
+          nramBatchPredicts[boxIdx * 7 + 2] =
+            src[2 * totalBoxAfterNmsPad + maxIdx];
+          nramBatchPredicts[boxIdx * 7 + 3] =
+            src[3 * totalBoxAfterNmsPad + maxIdx];
+          nramBatchPredicts[boxIdx * 7 + 4] =
+            src[4 * totalBoxAfterNmsPad + maxIdx];
+          nramBatchPredicts[boxIdx * 7 + 5] =
+            src[5 * totalBoxAfterNmsPad + maxIdx];
+          nramBatchPredicts[boxIdx * 7 + 6] =
+            src[6 * totalBoxAfterNmsPad + maxIdx];
+          src[2 * totalBoxAfterNmsPad + maxIdx] = 0;
+        }
+        __memcpy(batchPredicts + 64,
+                 nramBatchPredicts,
+                 num_max_boxes * 7 * sizeof(T),
+                 NRAM2GDRAM);
+      } else if (boxNumAfterNms > 0) {
+        __memcpy(src,
+                 result_nms,
+                 boxNumAfterNms * sizeof(T),
+                 topkLoad,
+                 totalBoxAfterNmsPad * sizeof(T),
+                 nmsStoreStride * sizeof(T),
+                 6);
+        int transSeg = boxNumAfterNms / 256;
+        int transRem = boxNumAfterNms % 256;
+        // transpose by segment
+        for (int i = 0; i < transSeg; i++) {
+          __memcpy(src + totalBoxAfterNmsPad * 7,
+                   src + 256 * i,
+                   256 * sizeof(T),
+                   NRAM2NRAM,
+                   256 * sizeof(T),
+                   totalBoxAfterNmsPad * sizeof(T),
+                   6);
+          __bang_transpose(src + totalBoxAfterNmsPad * 7 + 256 * 64,
+                           src + totalBoxAfterNmsPad * 7,
+                           64,
+                           256);
+          __memcpy(batchPredicts + 64 + 256 * 7 * i,
+                   src + totalBoxAfterNmsPad * 7 + 256 * 64,
+                   7 * sizeof(T),
+                   NRAM2GDRAM,
+                   7 * sizeof(T),
+                   64 * sizeof(T),
+                   256 - 1);
+        }
+        if (transRem > 0) {
+          __memcpy(src + totalBoxAfterNmsPad * 7,
+                   src + 256 * transSeg,
+                   PAD_UP(transRem, 64) * sizeof(T),
+                   NRAM2NRAM,
+                   PAD_UP(transRem, 64) * sizeof(T),
+                   totalBoxAfterNmsPad * sizeof(T),
+                   6);
+          __bang_transpose(src + totalBoxAfterNmsPad * 7 + PAD_UP(transRem, 64) * 64,
+                           src + totalBoxAfterNmsPad * 7,
+                           64,
+                           PAD_UP(transRem, 64));
+          __memcpy(batchPredicts + 64 + 256 * 7 * transSeg,
+                   src + totalBoxAfterNmsPad * 7 + PAD_UP(transRem, 64) * 64,
+                   7 * sizeof(T),
+                   NRAM2GDRAM,
+                   7 * sizeof(T),
+                   64 * sizeof(T),
+                   transRem - 1);
+        }
+      }
+    }
+    if (clusterDim > 0) {
+      // __sync_cluster_ipu();
+      __asm__ __volatile__("barrier.sync.local 2, %[cnt];\n\t"
+                           ::[cnt]"r"(coreDim));
+    }
+  }
+}
+
+#if __BANG_ARCH__ >= 270
+__mlu_entry__ void yolov3Kernel_MLU270(
+#elif __BANG_ARCH__ >= 220
+__mlu_entry__ void yolov3Kernel_MLU220(
+#endif
+  void* predicts,
+  void* input0,
+  void* input1,
+  void* input2,
+  void* input3,
+  void* input4,
+  void* input5,
+  void* input6,
+  void* buffer_gdram,
+  int* h_arr_gdram,
+  int* w_arr_gdram,
+  float * biases_gdram,
+  int num_inputs,
+  int num_classes,
+  int num_batches,
+  int num_mask_groups,
+  int num_max_boxes,
+  int PAD_SIZE,
+  int netw,
+  int neth,
+  int data_type,
+  float confidence_thresh,
+  float nms_thresh) {
+  // hardware timer
+  #if (__BANG_ARCH__ >= 200) && (__RECORD_TIME__ >= 1)
+  struct timeval tstart;
+  struct timeval tend;
+  uint32_t time_usec;
+  uint32_t time_sec;
+  gettimeofday(&tstart, NULL);
+  #endif
+  if (coreId != 0x80) {
+    // param log info
+    PRINTF_SCALAR("===== param check =====\n");
+    PRINTF_SCALAR("num_inputs: %d\n", num_inputs);
+    PRINTF_SCALAR("num_classes: %d\n", num_classes);
+    PRINTF_SCALAR("num_batches: %d\n", num_batches);
+    PRINTF_SCALAR("num_mask_groups: %d\n", num_mask_groups);
+    PRINTF_SCALAR("num_max_boxes: %d\n", num_max_boxes);
+    PRINTF_SCALAR("PAD_SIZE: %d\n", PAD_SIZE);
+    PRINTF_SCALAR("netw: %d\n", netw);
+    PRINTF_SCALAR("neth: %d\n", neth);
+    PRINTF_SCALAR("confidence_thresh: %f\n", confidence_thresh);
+    PRINTF_SCALAR("nms_thresh: %f\n", nms_thresh);
+
+    // load const data, including h/w_arr_gdram, bias_gdram, input ptrs etc.
+    __nram__ int h_arr[16];
+    __nram__ int w_arr[16];
+    __nram__ int imageWs[C_PAD_SIZE];
+    __nram__ int imageHs[C_PAD_SIZE];
+    __nram__ float biases[32];
+    void *inputs[16];
+    __memcpy(h_arr,
+             h_arr_gdram,
+             16 * sizeof(int), GDRAM2NRAM);
+    __memcpy(w_arr,
+             w_arr_gdram,
+             16 * sizeof(int), GDRAM2NRAM);
+    __memcpy(biases,
+             biases_gdram,
+             32 * sizeof(float), GDRAM2NRAM);
+    inputs[0] = input0;
+    inputs[1] = input1;
+    inputs[2] = input2;
+    inputs[3] = input3;
+    inputs[4] = input4;
+    inputs[5] = input5;
+    inputs[6] = input6;
+
+    /* memory usage
+     * arrange data in an order of life cycle, from long to short
+     * so that important result can be stored with concerning
+     * over-written by other calculation process.
+     */
+    __nram__ uint8_t buffer_n[NRAM_BUFFER_SIZE];
+    __mlu_shared__ uint8_t buffer_s[SRAM_BUFFER_SIZE];
+    __mlu_shared__ int boxCounts_sram[4];
+    __nram__       int boxCounts_nram[4];
+    __nram__ uint8_t conf_vector[512];
+    __nram__ uint8_t temp[256];
+
+    switch (data_type) {
+      case 0 : {
+        half* buffer_nram = (half *)buffer_n;
+        half* buffer_sram = (half *)buffer_s;
+        half* conf_vector_half = (half*)conf_vector;
+        half* temp_half = (half*)temp;
+        yolov3Kernel((half *)predicts,
+                     (half **)inputs,
+                     (half *)buffer_gdram,
+                     h_arr,
+                     w_arr,
+                     biases,
+                     buffer_nram,
+                     buffer_sram,
+                     boxCounts_nram,
+                     boxCounts_sram,
+                     conf_vector_half,
+                     temp_half,
+                     num_inputs,
+                     num_classes,
+                     num_batches,
+                     num_mask_groups,
+                     num_max_boxes,
+                     PAD_SIZE,
+                     netw,
+                     neth,
+                     (half)confidence_thresh,
+                     (half)nms_thresh);
+      }; break;
+      case 1 : {
+        float* buffer_nram = (float *)buffer_n;
+        float* buffer_sram = (float *)buffer_s;
+        float* conf_vector_half = (float *)conf_vector;
+        float* temp_half = (float *)temp;
+        yolov3Kernel((float *)predicts,
+                     (float **)inputs,
+                     (float *)buffer_gdram,
+                     h_arr,
+                     w_arr,
+                     biases,
+                     buffer_nram,
+                     buffer_sram,
+                     boxCounts_nram,
+                     boxCounts_sram,
+                     conf_vector_half,
+                     temp_half,
+                     num_inputs,
+                     num_classes,
+                     num_batches,
+                     num_mask_groups,
+                     num_max_boxes,
+                     PAD_SIZE,
+                     netw,
+                     neth,
+                     (float)confidence_thresh,
+                     (float)nms_thresh);
+      }; break;
+      default: {
+        printf("DATA_TYPE NOT SUPPORT: %d\n", data_type);
+      }
+    }
+  }
+  #if (__BANG_ARCH__ >= 200) && (__RECORD_TIME__ >= 1)
+  gettimeofday(&tend, NULL);
+  time_usec = (uint32_t)tend.tv_usec - (uint32_t)tstart.tv_usec;
+  time_sec = (uint32_t)tend.tv_sec - (uint32_t)tstart.tv_sec;
+  printf("Hardware Total Time: %u us\n", time_usec);
+  #endif
+}
